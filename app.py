@@ -2,10 +2,11 @@ import io
 import math
 import traceback
 
+import numpy as np
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
-from PIL import Image, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter
 import vtracer
 
 app = FastAPI(title="ZGrafic Vectorize API")
@@ -37,6 +38,34 @@ def ai_remove_background(img: Image.Image) -> Image.Image:
     from rembg import remove
     session = get_rembg_session()
     return remove(img.convert("RGBA"), session=session)
+
+
+def flat_remove_background(img: Image.Image, threshold: int = 22) -> Image.Image:
+    """
+    Recorte exacto por continuidad de color (flood-fill), sin difuminar bordes.
+    Ideal para clipart/ilustraciones con fondo solido: mucho mas preciso que un
+    modelo de IA generico para este caso, porque no deja el halo/desenfoque
+    que arruina el trazado vectorial despues.
+    """
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+    work = rgb.copy()
+    sentinel = (1, 2, 3)
+    seeds = [
+        (0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1),
+        (w // 2, 0), (w // 2, h - 1), (0, h // 2), (w - 1, h // 2),
+    ]
+    for seed in seeds:
+        try:
+            ImageDraw.floodfill(work, seed, sentinel, thresh=threshold)
+        except Exception:
+            pass
+
+    arr = np.array(work)
+    is_bg = np.all(arr == np.array(sentinel), axis=-1)
+    rgba = np.array(rgb.convert("RGBA"))
+    rgba[..., 3] = np.where(is_bg, 0, 255).astype("uint8")
+    return Image.fromarray(rgba, "RGBA")
 
 
 def clamp(v, lo, hi):
@@ -76,7 +105,8 @@ def analyze_image(img: Image.Image) -> dict:
         color_distance(corner_colors[i], corner_colors[j])
         for i in range(4) for j in range(i + 1, 4)
     )
-    flat_background = max_corner_dist < 45
+    flat_background = max_corner_dist < 60
+    very_flat_background = max_corner_dist < 20
 
     if photo_like:
         color_precision = 7
@@ -85,8 +115,8 @@ def analyze_image(img: Image.Image) -> dict:
         path_mode = "spline"
     else:
         color_precision = 5
-        corner_threshold = 38
-        filter_speckle = 8
+        corner_threshold = 42
+        filter_speckle = 12
         path_mode = "polygon" if edge_mean < 9 else "spline"
 
     return {
@@ -95,6 +125,7 @@ def analyze_image(img: Image.Image) -> dict:
         "filter_speckle": filter_speckle,
         "path_mode": path_mode,
         "remove_bg": flat_background,
+        "remove_bg_method": "exact" if very_flat_background else "ai",
     }
 
 
@@ -119,7 +150,10 @@ async def vectorize(file: UploadFile = File(...)):
 
         settings = analyze_image(img)
 
-        if settings["remove_bg"]:
+        if settings["remove_bg"] and settings["remove_bg_method"] == "exact":
+            work = flat_remove_background(img)
+            hierarchical = "cutout"
+        elif settings["remove_bg"]:
             work = ai_remove_background(img)
             hierarchical = "cutout"
         else:
